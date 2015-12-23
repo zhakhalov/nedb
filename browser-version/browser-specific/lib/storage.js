@@ -6,7 +6,10 @@
  * This version is the browser version
  */
 
-var localforage = require('localforage')
+/**
+ * Use built-in localforage module unless localforage already deefined.
+ */
+var localforage = (global || window).localforage || require('localforage');
 
 // Configure localforage to display NeDB name for now. Would be a good idea to let user use his own app name
 localforage.config({

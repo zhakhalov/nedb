@@ -1065,7 +1065,7 @@ var customUtils = require('./customUtils')
  *                                            Node Webkit stores application data such as cookies and local storage (the best place to store data in my opinion)
  * @param {Boolean} options.autoload Optional, defaults to false
  * @param {Function} options.onload Optional, if autoload is used this will be called after the load database with the error object as parameter. If you don't pass it the error will be thrown
- * @param {Function} options.afterSerialization and options.beforeDeserialization Optional, serialization hooks
+ * @param {Function} options.afterSerialization/options.beforeDeserialization Optional, serialization hooks
  * @param {Number} options.corruptAlertThreshold Optional, threshold after which an alert is thrown if too much data is corrupt
  */
 function Datastore (options) {
@@ -3060,7 +3060,7 @@ Persistence.prototype.treatRawData = function (rawData) {
 
   // A bit lenient on corruption
   if (data.length > 0 && corruptItems / data.length > this.corruptAlertThreshold) {
-    throw "More than 10% of the data file is corrupt, the wrong beforeDeserialization hook may be used. Cautiously refusing to start NeDB to prevent dataloss"
+    throw "More than " + Math.floor(100 * this.corruptAlertThreshold) + "% of the data file is corrupt, the wrong beforeDeserialization hook may be used. Cautiously refusing to start NeDB to prevent dataloss"
   }
 
   Object.keys(dataById).forEach(function (k) {
@@ -3135,7 +3135,7 @@ Persistence.prototype.loadDatabase = function (cb) {
 module.exports = Persistence;
 
 },{"./customUtils":6,"./indexes":9,"./model":10,"./storage":12,"__browserify_process":4,"async":13,"path":2}],12:[function(require,module,exports){
-/**
+var global=self;/**
  * Way data is stored for this database
  * For a Node.js/Node Webkit database it's the file system
  * For a browser-side database it's localforage, which uses the best backend available (IndexedDB then WebSQL then localStorage)
@@ -3143,7 +3143,10 @@ module.exports = Persistence;
  * This version is the browser version
  */
 
-var localforage = require('localforage')
+/**
+ * Use built-in localforage module unless localforage already deefined.
+ */
+var localforage = (global || window).localforage || require('localforage');
 
 // Configure localforage to display NeDB name for now. Would be a good idea to let user use his own app name
 localforage.config({
@@ -5240,7 +5243,7 @@ module.exports.defaultCheckValueEquality = defaultCheckValueEquality;
 },{}],18:[function(require,module,exports){
 var process=require("__browserify_process"),global=self;/*!
     localForage -- Offline Storage, Improved
-    Version 1.3.0
+    Version 1.3.1
     https://mozilla.github.io/localForage
     (c) 2013-2015 Mozilla, Apache License 2.0
 */
@@ -6641,7 +6644,7 @@ return /******/ (function(modules) { // webpackBootstrap
 	            dbInfo.db = dbContext.db = db;
 	            self._dbInfo = dbInfo;
 	            // Share the final connection amongst related localForages.
-	            for (var k in forages) {
+	            for (var k = 0; k < forages.length; k++) {
 	                var forage = forages[k];
 	                if (forage !== self) {
 	                    // Self is already up-to-date.
@@ -6835,10 +6838,13 @@ return /******/ (function(modules) { // webpackBootstrap
 	            var dbInfo;
 	            self.ready().then(function () {
 	                dbInfo = self._dbInfo;
-	                return _checkBlobSupport(dbInfo.db);
-	            }).then(function (blobSupport) {
-	                if (!blobSupport && value instanceof Blob) {
-	                    return _encodeBlob(value);
+	                if (value instanceof Blob) {
+	                    return _checkBlobSupport(dbInfo.db).then(function (blobSupport) {
+	                        if (blobSupport) {
+	                            return value;
+	                        }
+	                        return _encodeBlob(value);
+	                    });
 	                }
 	                return value;
 	            }).then(function (value) {
