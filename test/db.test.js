@@ -89,7 +89,7 @@ describe('Database', function () {
       db = new Datastore({ filename: autoDb, autoload: true, onload: onload })
 
       db.find({}, function (err, docs) {
-        done("Find should not be executed since autoload failed");
+        done(new Error("Find should not be executed since autoload failed"));
       });
     });
 
@@ -390,7 +390,7 @@ describe('Database', function () {
      *
      * Note: maybe using an in-memory only NeDB would give us an easier solution
      */
-    it('If the callback throws an uncaught execption, dont catch it inside findOne, this is userspace concern', function (done) {
+    it('If the callback throws an uncaught exception, do not catch it inside findOne, this is userspace concern', function (done) {
       var tryCount = 0
         , currentUncaughtExceptionHandlers = process.listeners('uncaughtException')
         , i
@@ -399,11 +399,13 @@ describe('Database', function () {
       process.removeAllListeners('uncaughtException');
 
       process.on('uncaughtException', function MINE (ex) {
+        process.removeAllListeners('uncaughtException');
+
         for (i = 0; i < currentUncaughtExceptionHandlers.length; i += 1) {
           process.on('uncaughtException', currentUncaughtExceptionHandlers[i]);
         }
 
-        ex.should.equal('SOME EXCEPTION');
+        ex.message.should.equal('SOME EXCEPTION');
         done();
       });
 
@@ -411,9 +413,9 @@ describe('Database', function () {
         d.findOne({ a : 5}, function (err, doc) {
           if (tryCount === 0) {
             tryCount += 1;
-            throw 'SOME EXCEPTION';
+            throw new Error('SOME EXCEPTION');
           } else {
-            done('Callback was called twice');
+            done(new Error('Callback was called twice'));
           }
         });
       });
@@ -430,16 +432,17 @@ describe('Database', function () {
           d.insert({ tf: 6 }, function () {
             d.insert({ tf: 4, an: 'other' }, function (err, _doc2) {
               d.insert({ tf: 9 }, function () {
-                var data = d.getCandidates({ r: 6, tf: 4 })
-                  , doc1 = _.find(data, function (d) { return d._id === _doc1._id; })
-                  , doc2 = _.find(data, function (d) { return d._id === _doc2._id; })
-                  ;
+                d.getCandidates({ r: 6, tf: 4 }, function (err, data) {
+                  var doc1 = _.find(data, function (d) { return d._id === _doc1._id; })
+                    , doc2 = _.find(data, function (d) { return d._id === _doc2._id; })
+                    ;
 
-                data.length.should.equal(2);
-                assert.deepEqual(doc1, { _id: doc1._id, tf: 4 });
-                assert.deepEqual(doc2, { _id: doc2._id, tf: 4, an: 'other' });
+                  data.length.should.equal(2);
+                  assert.deepEqual(doc1, { _id: doc1._id, tf: 4 });
+                  assert.deepEqual(doc2, { _id: doc2._id, tf: 4, an: 'other' });
 
-                done();
+                  done();
+                });
               });
             });
           });
@@ -453,16 +456,17 @@ describe('Database', function () {
           d.insert({ tf: 6 }, function (err, _doc1) {
             d.insert({ tf: 4, an: 'other' }, function (err) {
               d.insert({ tf: 9 }, function (err, _doc2) {
-                var data = d.getCandidates({ r: 6, tf: { $in: [6, 9, 5] } })
-                  , doc1 = _.find(data, function (d) { return d._id === _doc1._id; })
-                  , doc2 = _.find(data, function (d) { return d._id === _doc2._id; })
-                  ;
+                d.getCandidates({ r: 6, tf: { $in: [6, 9, 5] } }, function (err, data) {
+                  var doc1 = _.find(data, function (d) { return d._id === _doc1._id; })
+                    , doc2 = _.find(data, function (d) { return d._id === _doc2._id; })
+                    ;
 
-                data.length.should.equal(2);
-                assert.deepEqual(doc1, { _id: doc1._id, tf: 6 });
-                assert.deepEqual(doc2, { _id: doc2._id, tf: 9 });
+                  data.length.should.equal(2);
+                  assert.deepEqual(doc1, { _id: doc1._id, tf: 6 });
+                  assert.deepEqual(doc2, { _id: doc2._id, tf: 9 });
 
-                done();
+                  done();
+                });
               });
             });
           });
@@ -476,20 +480,21 @@ describe('Database', function () {
           d.insert({ tf: 6 }, function (err, _doc2) {
             d.insert({ tf: 4, an: 'other' }, function (err, _doc3) {
               d.insert({ tf: 9 }, function (err, _doc4) {
-                var data = d.getCandidates({ r: 6, notf: { $in: [6, 9, 5] } })
-                  , doc1 = _.find(data, function (d) { return d._id === _doc1._id; })
-                  , doc2 = _.find(data, function (d) { return d._id === _doc2._id; })
-                  , doc3 = _.find(data, function (d) { return d._id === _doc3._id; })
-                  , doc4 = _.find(data, function (d) { return d._id === _doc4._id; })
-                  ;
+                d.getCandidates({ r: 6, notf: { $in: [6, 9, 5] } }, function (err, data) {
+                  var doc1 = _.find(data, function (d) { return d._id === _doc1._id; })
+                    , doc2 = _.find(data, function (d) { return d._id === _doc2._id; })
+                    , doc3 = _.find(data, function (d) { return d._id === _doc3._id; })
+                    , doc4 = _.find(data, function (d) { return d._id === _doc4._id; })
+                    ;
 
-                data.length.should.equal(4);
-                assert.deepEqual(doc1, { _id: doc1._id, tf: 4 });
-                assert.deepEqual(doc2, { _id: doc2._id, tf: 6 });
-                assert.deepEqual(doc3, { _id: doc3._id, tf: 4, an: 'other' });
-                assert.deepEqual(doc4, { _id: doc4._id, tf: 9 });
+                  data.length.should.equal(4);
+                  assert.deepEqual(doc1, { _id: doc1._id, tf: 4 });
+                  assert.deepEqual(doc2, { _id: doc2._id, tf: 6 });
+                  assert.deepEqual(doc3, { _id: doc3._id, tf: 4, an: 'other' });
+                  assert.deepEqual(doc4, { _id: doc4._id, tf: 9 });
 
-                done();
+                  done();
+                });
               });
             });
           });
@@ -503,17 +508,120 @@ describe('Database', function () {
           d.insert({ tf: 6 }, function (err, _doc2) {
             d.insert({ tf: 4, an: 'other' }, function (err, _doc3) {
               d.insert({ tf: 9 }, function (err, _doc4) {
-                var data = d.getCandidates({ r: 6, tf: { $lte: 9, $gte: 6 } })
-                  , doc2 = _.find(data, function (d) { return d._id === _doc2._id; })
-                  , doc4 = _.find(data, function (d) { return d._id === _doc4._id; })
-                  ;
+                d.getCandidates({ r: 6, tf: { $lte: 9, $gte: 6 } }, function (err, data) {
+                  var doc2 = _.find(data, function (d) { return d._id === _doc2._id; })
+                    , doc4 = _.find(data, function (d) { return d._id === _doc4._id; })
+                    ;
 
-                data.length.should.equal(2);
-                assert.deepEqual(doc2, { _id: doc2._id, tf: 6 });
-                assert.deepEqual(doc4, { _id: doc4._id, tf: 9 });
+                  data.length.should.equal(2);
+                  assert.deepEqual(doc2, { _id: doc2._id, tf: 6 });
+                  assert.deepEqual(doc4, { _id: doc4._id, tf: 9 });
 
-                done();
+                  done();
+                });
               });
+            });
+          });
+        });
+      });
+    });
+
+    it("Can set a TTL index that expires documents", function (done) {
+      d.ensureIndex({ fieldName: 'exp', expireAfterSeconds: 0.2 }, function () {
+        d.insert({ hello: 'world', exp: new Date() }, function () {
+          setTimeout(function () {
+            d.findOne({}, function (err, doc) {
+              assert.isNull(err);
+              doc.hello.should.equal('world');
+
+              setTimeout(function () {
+                d.findOne({}, function (err, doc) {
+                  assert.isNull(err);
+                  assert.isNull(doc);
+
+                  d.on('compaction.done', function () {
+                    // After compaction, no more mention of the document, correctly removed
+                    var datafileContents = fs.readFileSync(testDb, 'utf8');
+                    datafileContents.split('\n').length.should.equal(2);
+                    assert.isNull(datafileContents.match(/world/));
+
+                    // New datastore on same datafile is empty
+                    var d2 = new Datastore({ filename: testDb, autoload: true });
+                    d2.findOne({}, function (err, doc) {
+                      assert.isNull(err);
+                      assert.isNull(doc);
+
+                      done();
+                    });
+                  });
+
+                  d.persistence.compactDatafile();
+                });
+              }, 101);
+            });
+          }, 100);
+        });
+      });
+    });
+
+    it("TTL indexes can expire multiple documents and only what needs to be expired", function (done) {
+      d.ensureIndex({ fieldName: 'exp', expireAfterSeconds: 0.2 }, function () {
+        d.insert({ hello: 'world1', exp: new Date() }, function () {
+          d.insert({ hello: 'world2', exp: new Date() }, function () {
+            d.insert({ hello: 'world3', exp: new Date((new Date()).getTime() + 100) }, function () {
+              setTimeout(function () {
+                d.find({}, function (err, docs) {
+                  assert.isNull(err);
+                  docs.length.should.equal(3);
+
+                  setTimeout(function () {
+                    d.find({}, function (err, docs) {
+                      assert.isNull(err);
+                      docs.length.should.equal(1);
+                      docs[0].hello.should.equal('world3');
+
+                      setTimeout(function () {
+                        d.find({}, function (err, docs) {
+                          assert.isNull(err);
+                          docs.length.should.equal(0);
+
+                          done();
+                        });
+                      }, 101);
+                    });
+                  }, 101);
+                });
+              }, 100);
+            });
+          });
+        });
+      });
+    });
+
+    it("Document where indexed field is absent or not a date are ignored", function (done) {
+      d.ensureIndex({ fieldName: 'exp', expireAfterSeconds: 0.2 }, function () {
+        d.insert({ hello: 'world1', exp: new Date() }, function () {
+          d.insert({ hello: 'world2', exp: "not a date" }, function () {
+            d.insert({ hello: 'world3' }, function () {
+              setTimeout(function () {
+                d.find({}, function (err, docs) {
+                  assert.isNull(err);
+                  docs.length.should.equal(3);
+
+                  setTimeout(function () {
+                    d.find({}, function (err, docs) {
+                      assert.isNull(err);
+                      docs.length.should.equal(2);
+
+
+                      docs[0].hello.should.not.equal('world1');
+                      docs[1].hello.should.not.equal('world1');
+
+                      done();
+                    });
+                  }, 101);
+                });
+              }, 100);
             });
           });
         });
@@ -1472,6 +1580,40 @@ describe('Database', function () {
             });
 
             done();
+          });
+        });
+      });
+    });
+
+    it("If options.returnUpdatedDocs is true, return all matched docs", function (done) {
+      d.insert([{ a: 4 }, { a: 5 }, { a: 6 }], function (err, docs) {
+        docs.length.should.equal(3);
+
+        d.update({ a: 7 }, { $set: { u: 1 } }, { multi: true, returnUpdatedDocs: true }, function (err, num, updatedDocs) {
+          num.should.equal(0);
+          updatedDocs.length.should.equal(0);
+
+          d.update({ a: 5 }, { $set: { u: 2 } }, { multi: true, returnUpdatedDocs: true }, function (err, num, updatedDocs) {
+            num.should.equal(1);
+            updatedDocs.length.should.equal(1);
+            updatedDocs[0].a.should.equal(5);
+            updatedDocs[0].u.should.equal(2);
+
+            d.update({ a: { $in: [4, 6] } }, { $set: { u: 3 } }, { multi: true, returnUpdatedDocs: true }, function (err, num, updatedDocs) {
+              num.should.equal(2);
+              updatedDocs.length.should.equal(2);
+              updatedDocs[0].u.should.equal(3);
+              updatedDocs[1].u.should.equal(3);
+              if (updatedDocs[0].a === 4) {
+                updatedDocs[0].a.should.equal(4);
+                updatedDocs[1].a.should.equal(6);
+              } else {
+                updatedDocs[0].a.should.equal(6);
+                updatedDocs[1].a.should.equal(4);
+              }
+
+              done();
+            });
           });
         });
       });
@@ -2613,9 +2755,10 @@ describe('Database', function () {
     it('Results of getMatching should never contain duplicates', function (done) {
       d.ensureIndex({ fieldName: 'bad' });
       d.insert({ bad: ['a', 'b'] }, function () {
-        var res = d.getCandidates({ bad: { $in: ['a', 'b'] } });
-        res.length.should.equal(1);
-        done();
+        d.getCandidates({ bad: { $in: ['a', 'b'] } }, function (err, res) {
+          res.length.should.equal(1);
+          done();
+        });
       });
     });
 

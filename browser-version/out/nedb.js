@@ -856,7 +856,7 @@ Cursor.prototype.project = function (candidates) {
   // Check for consistency
   keys = Object.keys(this._projection);
   keys.forEach(function (k) {
-    if (action !== undefined && self._projection[k] !== action) { throw "Can't both keep and omit fields except for _id"; }
+    if (action !== undefined && self._projection[k] !== action) { throw new Error("Can't both keep and omit fields except for _id"); }
     action = self._projection[k];
   });
 
@@ -882,76 +882,83 @@ Cursor.prototype.project = function (candidates) {
  *
  * @param {Function} callback - Signature: err, results
  */
-Cursor.prototype._exec = function(callback) {
-  var candidates = this.db.getCandidates(this.query)
-    , res = [], added = 0, skipped = 0, self = this
+Cursor.prototype._exec = function(_callback) {
+  var res = [], added = 0, skipped = 0, self = this
     , error = null
     , i, keys, key
     ;
 
-  try {
-    for (i = 0; i < candidates.length; i += 1) {
-      if (model.match(candidates[i], this.query)) {
-        // If a sort is defined, wait for the results to be sorted before applying limit and skip
-        if (!this._sort) {
-          if (this._skip && this._skip > skipped) {
-            skipped += 1;
+  function callback (error, res) {
+    if (self.execFn) {
+      return self.execFn(error, res, _callback);
+    } else {
+      return _callback(error, res);
+    }
+  }
+
+  this.db.getCandidates(this.query, function (err, candidates) {
+    if (err) { return callback(err); }
+
+    try {
+      for (i = 0; i < candidates.length; i += 1) {
+        if (model.match(candidates[i], self.query)) {
+          // If a sort is defined, wait for the results to be sorted before applying limit and skip
+          if (!self._sort) {
+            if (self._skip && self._skip > skipped) {
+              skipped += 1;
+            } else {
+              res.push(candidates[i]);
+              added += 1;
+              if (self._limit && self._limit <= added) { break; }
+            }
           } else {
             res.push(candidates[i]);
-            added += 1;
-            if (this._limit && this._limit <= added) { break; }
           }
-        } else {
-          res.push(candidates[i]);
         }
       }
+    } catch (err) {
+      return callback(err);
     }
-  } catch (err) {
-    return callback(err);
-  }
 
-  // Apply all sorts
-  if (this._sort) {
-    keys = Object.keys(this._sort);
+    // Apply all sorts
+    if (self._sort) {
+      keys = Object.keys(self._sort);
 
-    // Sorting
-    var criteria = [];
-    for (i = 0; i < keys.length; i++) {
-      key = keys[i];
-      criteria.push({ key: key, direction: self._sort[key] });
-    }
-    res.sort(function(a, b) {
-      var criterion, compare, i;
-      for (i = 0; i < criteria.length; i++) {
-        criterion = criteria[i];
-        compare = criterion.direction * model.compareThings(model.getDotValue(a, criterion.key), model.getDotValue(b, criterion.key));
-        if (compare !== 0) {
-          return compare;
-        }
+      // Sorting
+      var criteria = [];
+      for (i = 0; i < keys.length; i++) {
+        key = keys[i];
+        criteria.push({ key: key, direction: self._sort[key] });
       }
-      return 0;
-    });
+      res.sort(function(a, b) {
+        var criterion, compare, i;
+        for (i = 0; i < criteria.length; i++) {
+          criterion = criteria[i];
+          compare = criterion.direction * model.compareThings(model.getDotValue(a, criterion.key), model.getDotValue(b, criterion.key), self.db.compareStrings);
+          if (compare !== 0) {
+            return compare;
+          }
+        }
+        return 0;
+      });
 
-    // Applying limit and skip
-    var limit = this._limit || res.length
-      , skip = this._skip || 0;
+      // Applying limit and skip
+      var limit = self._limit || res.length
+        , skip = self._skip || 0;
 
-    res = res.slice(skip, skip + limit);
-  }
+      res = res.slice(skip, skip + limit);
+    }
 
-  // Apply projection
-  try {
-    res = this.project(res);
-  } catch (e) {
-    error = e;
-    res = undefined;
-  }
+    // Apply projection
+    try {
+      res = self.project(res);
+    } catch (e) {
+      error = e;
+      res = undefined;
+    }
 
-  if (this.execFn) {
-    return this.execFn(error, res, callback);
-  } else {
     return callback(error, res);
-  }
+  });
 };
 
 Cursor.prototype.exec = function () {
@@ -1067,6 +1074,10 @@ var customUtils = require('./customUtils')
  * @param {Function} options.onload Optional, if autoload is used this will be called after the load database with the error object as parameter. If you don't pass it the error will be thrown
  * @param {Function} options.afterSerialization/options.beforeDeserialization Optional, serialization hooks
  * @param {Number} options.corruptAlertThreshold Optional, threshold after which an alert is thrown if too much data is corrupt
+ * @param {Function} options.compareStrings Optional, string comparison function that overrides default for sorting
+ *
+ * Event Emitter - Events
+ * * compaction.done - Fired whenever a compaction operation was finished
  */
 function Datastore (options) {
   var filename;
@@ -1091,6 +1102,9 @@ function Datastore (options) {
     this.filename = filename;
   }
 
+  // String comparison function
+  this.compareStrings = options.compareStrings;
+
   // Persistence handling
   this.persistence = new Persistence({ db: this, nodeWebkitAppName: options.nodeWebkitAppName
                                       , afterSerialization: options.afterSerialization
@@ -1108,6 +1122,7 @@ function Datastore (options) {
   // binary is always well-balanced
   this.indexes = {};
   this.indexes._id = new Index({ fieldName: '_id', unique: true });
+  this.ttlIndexes = {};
 
   // Queue a load of the database right away and call the onload handler
   // By default (no onload handler), if there is an error there, no operation will be possible so warn the user by throwing an exception
@@ -1115,6 +1130,8 @@ function Datastore (options) {
     if (err) { throw err; }
   }); }
 }
+
+util.inherits(Datastore, require('events').EventEmitter);
 
 
 /**
@@ -1152,17 +1169,24 @@ Datastore.prototype.resetIndexes = function (newData) {
  * @param {String} options.fieldName
  * @param {Boolean} options.unique
  * @param {Boolean} options.sparse
+ * @param {Number} options.expireAfterSeconds - Optional, if set this index becomes a TTL index (only works on Date fields, not arrays of Date)
  * @param {Function} cb Optional callback, signature: err
  */
 Datastore.prototype.ensureIndex = function (options, cb) {
-  var callback = cb || function () {};
+  var err
+    , callback = cb || function () {};
 
   options = options || {};
 
-  if (!options.fieldName) { return callback({ missingFieldName: true }); }
+  if (!options.fieldName) {
+    err = new Error("Cannot create an index without a fieldName");
+    err.missingFieldName = true;
+    return callback(err);
+  }
   if (this.indexes[options.fieldName]) { return callback(null); }
 
   this.indexes[options.fieldName] = new Index(options);
+  if (options.expireAfterSeconds !== undefined) { this.ttlIndexes[options.fieldName] = options.expireAfterSeconds; }   // With this implementation index creation is not necessary to ensure TTL but we stick with MongoDB's API here
 
   try {
     this.indexes[options.fieldName].insert(this.getAllData());
@@ -1275,50 +1299,89 @@ Datastore.prototype.updateIndexes = function (oldDoc, newDoc) {
  * One way to make it better would be to enable the use of multiple indexes if the first usable index
  * returns too much data. I may do it in the future.
  *
- * TODO: needs to be moved to the Cursor module
+ * Returned candidates will be scanned to find and remove all expired documents
+ *
+ * @param {Query} query
+ * @param {Boolean} dontExpireStaleDocs Optional, defaults to false, if true don't remove stale docs. Useful for the remove function which shouldn't be impacted by expirations
+ * @param {Function} callback Signature err, docs
  */
-Datastore.prototype.getCandidates = function (query) {
+Datastore.prototype.getCandidates = function (query, dontExpireStaleDocs, callback) {
   var indexNames = Object.keys(this.indexes)
+    , self = this
     , usableQueryKeys;
 
-  // For a basic match
-  usableQueryKeys = [];
-  Object.keys(query).forEach(function (k) {
-    if (typeof query[k] === 'string' || typeof query[k] === 'number' || typeof query[k] === 'boolean' || util.isDate(query[k]) || query[k] === null) {
-      usableQueryKeys.push(k);
-    }
-  });
-  usableQueryKeys = _.intersection(usableQueryKeys, indexNames);
-  if (usableQueryKeys.length > 0) {
-    return this.indexes[usableQueryKeys[0]].getMatching(query[usableQueryKeys[0]]);
+  if (typeof dontExpireStaleDocs === 'function') {
+    callback = dontExpireStaleDocs;
+    dontExpireStaleDocs = false;
   }
 
-  // For a $in match
-  usableQueryKeys = [];
-  Object.keys(query).forEach(function (k) {
-    if (query[k] && query[k].hasOwnProperty('$in')) {
-      usableQueryKeys.push(k);
+  async.waterfall([
+  // STEP 1: get candidates list by checking indexes from most to least frequent usecase
+  function (cb) {
+    // For a basic match
+    usableQueryKeys = [];
+    Object.keys(query).forEach(function (k) {
+      if (typeof query[k] === 'string' || typeof query[k] === 'number' || typeof query[k] === 'boolean' || util.isDate(query[k]) || query[k] === null) {
+        usableQueryKeys.push(k);
+      }
+    });
+    usableQueryKeys = _.intersection(usableQueryKeys, indexNames);
+    if (usableQueryKeys.length > 0) {
+      return cb(null, self.indexes[usableQueryKeys[0]].getMatching(query[usableQueryKeys[0]]));
     }
-  });
-  usableQueryKeys = _.intersection(usableQueryKeys, indexNames);
-  if (usableQueryKeys.length > 0) {
-    return this.indexes[usableQueryKeys[0]].getMatching(query[usableQueryKeys[0]].$in);
-  }
 
-  // For a comparison match
-  usableQueryKeys = [];
-  Object.keys(query).forEach(function (k) {
-    if (query[k] && (query[k].hasOwnProperty('$lt') || query[k].hasOwnProperty('$lte') || query[k].hasOwnProperty('$gt') || query[k].hasOwnProperty('$gte'))) {
-      usableQueryKeys.push(k);
+    // For a $in match
+    usableQueryKeys = [];
+    Object.keys(query).forEach(function (k) {
+      if (query[k] && query[k].hasOwnProperty('$in')) {
+        usableQueryKeys.push(k);
+      }
+    });
+    usableQueryKeys = _.intersection(usableQueryKeys, indexNames);
+    if (usableQueryKeys.length > 0) {
+      return cb(null, self.indexes[usableQueryKeys[0]].getMatching(query[usableQueryKeys[0]].$in));
     }
-  });
-  usableQueryKeys = _.intersection(usableQueryKeys, indexNames);
-  if (usableQueryKeys.length > 0) {
-    return this.indexes[usableQueryKeys[0]].getBetweenBounds(query[usableQueryKeys[0]]);
-  }
 
-  // By default, return all the DB data
-  return this.getAllData();
+    // For a comparison match
+    usableQueryKeys = [];
+    Object.keys(query).forEach(function (k) {
+      if (query[k] && (query[k].hasOwnProperty('$lt') || query[k].hasOwnProperty('$lte') || query[k].hasOwnProperty('$gt') || query[k].hasOwnProperty('$gte'))) {
+        usableQueryKeys.push(k);
+      }
+    });
+    usableQueryKeys = _.intersection(usableQueryKeys, indexNames);
+    if (usableQueryKeys.length > 0) {
+      return cb(null, self.indexes[usableQueryKeys[0]].getBetweenBounds(query[usableQueryKeys[0]]));
+    }
+
+    // By default, return all the DB data
+    return cb(null, self.getAllData());
+  }
+  // STEP 2: remove all expired documents
+  , function (docs) {
+    if (dontExpireStaleDocs) { return callback(null, docs); }
+
+    var expiredDocsIds = [], validDocs = [], ttlIndexesFieldNames = Object.keys(self.ttlIndexes);
+
+    docs.forEach(function (doc) {
+      var valid = true;
+      ttlIndexesFieldNames.forEach(function (i) {
+        if (doc[i] !== undefined && util.isDate(doc[i]) && Date.now() > doc[i].getTime() + self.ttlIndexes[i] * 1000) {
+          valid = false;
+        }
+      });
+      if (valid) { validDocs.push(doc); } else { expiredDocsIds.push(doc._id); }
+    });
+
+    async.eachSeries(expiredDocsIds, function (_id, cb) {
+      self._remove({ _id: _id }, {}, function (err) {
+        if (err) { return callback(err); }
+        return cb();
+      });
+    }, function (err) {
+      return callback(null, validDocs);
+    });
+  }]);
 };
 
 
@@ -1522,12 +1585,12 @@ Datastore.prototype.findOne = function (query, projection, callback) {
 
 /**
  * Update all docs matching query
- * For now, very naive implementation (recalculating the whole database)
  * @param {Object} query
  * @param {Object} updateQuery
  * @param {Object} options Optional options
  *                 options.multi If true, can update multiple documents (defaults to false)
  *                 options.upsert If true, document is inserted if the query doesn't match anything
+ *                 options.returnUpdatedDocs Defaults to false, if true return as third argument the array of updated matched documents (even if no change actually took place)
  * @param {Function} cb Optional callback, signature: err, numReplaced, upsert (set to true if the update was in fact an upsert)
  *
  * @api private Use Datastore.update which has the same signature
@@ -1580,41 +1643,49 @@ Datastore.prototype._update = function (query, updateQuery, options, cb) {
     });
   }
   , function () {   // Perform the update
-    var modifiedDoc
-	  , candidates = self.getCandidates(query)
-	  , modifications = []
-	  ;
+    var modifiedDoc , modifications = [];
 
-    // Preparing update (if an error is thrown here neither the datafile nor
-    // the in-memory indexes are affected)
-    try {
-      for (i = 0; i < candidates.length; i += 1) {
-        if (model.match(candidates[i], query) && (multi || numReplaced === 0)) {
-          numReplaced += 1;
-          modifiedDoc = model.modify(candidates[i], updateQuery);
-          if (self.timestampData) { modifiedDoc.updatedAt = new Date(); }
-          modifications.push({ oldDoc: candidates[i], newDoc: modifiedDoc });
-        }
-      }
-    } catch (err) {
-      return callback(err);
-    }
-
-    // Change the docs in memory
-    try {
-        self.updateIndexes(modifications);
-    } catch (err) {
-      return callback(err);
-    }
-
-    // Update the datafile
-    self.persistence.persistNewState(_.pluck(modifications, 'newDoc'), function (err) {
+    self.getCandidates(query, function (err, candidates) {
       if (err) { return callback(err); }
-      return callback(null, numReplaced);
+
+      // Preparing update (if an error is thrown here neither the datafile nor
+      // the in-memory indexes are affected)
+      try {
+        for (i = 0; i < candidates.length; i += 1) {
+          if (model.match(candidates[i], query) && (multi || numReplaced === 0)) {
+            numReplaced += 1;
+            modifiedDoc = model.modify(candidates[i], updateQuery);
+            if (self.timestampData) { modifiedDoc.updatedAt = new Date(); }
+            modifications.push({ oldDoc: candidates[i], newDoc: modifiedDoc });
+          }
+        }
+      } catch (err) {
+        return callback(err);
+      }
+
+      // Change the docs in memory
+      try {
+        self.updateIndexes(modifications);
+      } catch (err) {
+        return callback(err);
+      }
+
+      // Update the datafile
+      var updatedDocs = _.pluck(modifications, 'newDoc');
+      self.persistence.persistNewState(updatedDocs, function (err) {
+        if (err) { return callback(err); }
+        if (!options.returnUpdatedDocs) {
+          return callback(null, numReplaced);
+        } else {
+          var updatedDocsDC = [];
+          updatedDocs.forEach(function (doc) { updatedDocsDC.push(model.deepCopy(doc)); });
+          return callback(null, numReplaced, updatedDocsDC);
+        }
+      });
     });
-  }
-  ]);
+  }]);
 };
+
 Datastore.prototype.update = function () {
   this.executor.push({ this: this, fn: this._update, arguments: arguments });
 };
@@ -1632,44 +1703,42 @@ Datastore.prototype.update = function () {
  */
 Datastore.prototype._remove = function (query, options, cb) {
   var callback
-    , self = this
-    , numRemoved = 0
-    , multi
-    , removedDocs = []
-    , candidates = this.getCandidates(query)
+    , self = this, numRemoved = 0, removedDocs = [], multi
     ;
 
   if (typeof options === 'function') { cb = options; options = {}; }
   callback = cb || function () {};
   multi = options.multi !== undefined ? options.multi : false;
 
-  try {
-    candidates.forEach(function (d) {
-      if (model.match(d, query) && (multi || numRemoved === 0)) {
-        numRemoved += 1;
-        removedDocs.push({ $$deleted: true, _id: d._id });
-        self.removeFromIndexes(d);
-      }
-    });
-  } catch (err) { return callback(err); }
-
-  self.persistence.persistNewState(removedDocs, function (err) {
+  this.getCandidates(query, true, function (err, candidates) {
     if (err) { return callback(err); }
-    return callback(null, numRemoved);
+
+    try {
+      candidates.forEach(function (d) {
+        if (model.match(d, query) && (multi || numRemoved === 0)) {
+          numRemoved += 1;
+          removedDocs.push({ $$deleted: true, _id: d._id });
+          self.removeFromIndexes(d);
+        }
+      });
+    } catch (err) { return callback(err); }
+
+    self.persistence.persistNewState(removedDocs, function (err) {
+      if (err) { return callback(err); }
+      return callback(null, numRemoved);
+    });
   });
 };
+
 Datastore.prototype.remove = function () {
   this.executor.push({ this: this, fn: this._remove, arguments: arguments });
 };
 
 
 
-
-
-
 module.exports = Datastore;
 
-},{"./cursor":5,"./customUtils":6,"./executor":8,"./indexes":9,"./model":10,"./persistence":11,"async":13,"underscore":19,"util":3}],8:[function(require,module,exports){
+},{"./cursor":5,"./customUtils":6,"./executor":8,"./indexes":9,"./model":10,"./persistence":11,"async":13,"events":1,"underscore":19,"util":3}],8:[function(require,module,exports){
 var process=require("__browserify_process");/**
  * Responsible for sequentially executing actions on the database
  */
@@ -1771,7 +1840,7 @@ function projectForUnique (elt) {
   if (typeof elt === 'boolean') { return '$boolean' + elt; }
   if (typeof elt === 'number') { return '$number' + elt; }
   if (util.isArray(elt)) { return '$date' + elt.getTime(); }
-  
+
   return elt;   // Arrays and objects, will check for pointer equality
 }
 
@@ -1839,12 +1908,12 @@ Index.prototype.insert = function (doc) {
         break;
       }
     }
-    
+
     if (error) {
       for (i = 0; i < failingI; i += 1) {
         this.tree.delete(keys[i], doc);
       }
-      
+
       throw error;
     }
   }
@@ -1981,16 +2050,6 @@ Index.prototype.revertUpdate = function (oldDoc, newDoc) {
 };
 
 
-// Append all elements in toAppend to array
-function append (array, toAppend) {
-  var i;
-
-  for (i = 0; i < toAppend.length; i += 1) {
-    array.push(toAppend[i]);
-  }
-}
-
-
 /**
  * Get all documents in index whose key match value (if it is a Thing) or one of the elements of value (if it is an array of Things)
  * @param {Thing} value Value to match the key against
@@ -2000,7 +2059,7 @@ Index.prototype.getMatching = function (value) {
   var self = this;
 
   if (!util.isArray(value)) {
-    return this.tree.search(value);
+    return self.tree.search(value);
   } else {
     var _res = {}, res = [];
 
@@ -2086,11 +2145,11 @@ function checkKey (k, v) {
   }
 
   if (k[0] === '$' && !(k === '$$date' && typeof v === 'number') && !(k === '$$deleted' && v === true) && !(k === '$$indexCreated') && !(k === '$$indexRemoved')) {
-    throw 'Field names cannot begin with the $ character';
+    throw new Error('Field names cannot begin with the $ character');
   }
 
   if (k.indexOf('.') !== -1) {
-    throw 'Field names cannot contain a .';
+    throw new Error('Field names cannot contain a .');
   }
 }
 
@@ -2240,9 +2299,12 @@ function compareArrays (a, b) {
  * In the case of objects and arrays, we deep-compare
  * If two objects dont have the same type, the (arbitrary) type hierarchy is: undefined, null, number, strings, boolean, dates, arrays, objects
  * Return -1 if a < b, 1 if a > b and 0 if a = b (note that equality here is NOT the same as defined in areThingsEqual!)
+ *
+ * @param {Function} _compareStrings String comparing function, returning -1, 0 or 1, overriding default string comparison (useful for languages with accented letters)
  */
-function compareThings (a, b) {
-  var aKeys, bKeys, comp, i;
+function compareThings (a, b, _compareStrings) {
+  var aKeys, bKeys, comp, i
+    , compareStrings = _compareStrings || compareNSB;
 
   // undefined
   if (a === undefined) { return b === undefined ? 0 : -1; }
@@ -2257,8 +2319,8 @@ function compareThings (a, b) {
   if (typeof b === 'number') { return typeof a === 'number' ? compareNSB(a, b) : 1; }
 
   // Strings
-  if (typeof a === 'string') { return typeof b === 'string' ? compareNSB(a, b) : -1; }
-  if (typeof b === 'string') { return typeof a === 'string' ? compareNSB(a, b) : 1; }
+  if (typeof a === 'string') { return typeof b === 'string' ? compareStrings(a, b) : -1; }
+  if (typeof b === 'string') { return typeof a === 'string' ? compareStrings(a, b) : 1; }
 
   // Booleans
   if (typeof a === 'boolean') { return typeof b === 'boolean' ? compareNSB(a, b) : -1; }
@@ -2323,11 +2385,11 @@ lastStepModifierFunctions.$push = function (obj, field, value) {
   // Create the array if it doesn't exist
   if (!obj.hasOwnProperty(field)) { obj[field] = []; }
 
-  if (!util.isArray(obj[field])) { throw "Can't $push an element on non-array values"; }
+  if (!util.isArray(obj[field])) { throw new Error("Can't $push an element on non-array values"); }
 
   if (value !== null && typeof value === 'object' && value.$each) {
-    if (Object.keys(value).length > 1) { throw "Can't use another field in conjunction with $each"; }
-    if (!util.isArray(value.$each)) { throw "$each requires an array value"; }
+    if (Object.keys(value).length > 1) { throw new Error("Can't use another field in conjunction with $each"); }
+    if (!util.isArray(value.$each)) { throw new Error("$each requires an array value"); }
 
     value.$each.forEach(function (v) {
       obj[field].push(v);
@@ -2349,11 +2411,11 @@ lastStepModifierFunctions.$addToSet = function (obj, field, value) {
   // Create the array if it doesn't exist
   if (!obj.hasOwnProperty(field)) { obj[field] = []; }
 
-  if (!util.isArray(obj[field])) { throw "Can't $addToSet an element on non-array values"; }
+  if (!util.isArray(obj[field])) { throw new Error("Can't $addToSet an element on non-array values"); }
 
   if (value !== null && typeof value === 'object' && value.$each) {
-    if (Object.keys(value).length > 1) { throw "Can't use another field in conjunction with $each"; }
-    if (!util.isArray(value.$each)) { throw "$each requires an array value"; }
+    if (Object.keys(value).length > 1) { throw new Error("Can't use another field in conjunction with $each"); }
+    if (!util.isArray(value.$each)) { throw new Error("$each requires an array value"); }
 
     value.$each.forEach(function (v) {
       lastStepModifierFunctions.$addToSet(obj, field, v);
@@ -2371,8 +2433,8 @@ lastStepModifierFunctions.$addToSet = function (obj, field, value) {
  * Remove the first or last element of an array
  */
 lastStepModifierFunctions.$pop = function (obj, field, value) {
-  if (!util.isArray(obj[field])) { throw "Can't $pop an element from non-array values"; }
-  if (typeof value !== 'number') { throw value + " isn't an integer, can't use it with $pop"; }
+  if (!util.isArray(obj[field])) { throw new Error("Can't $pop an element from non-array values"); }
+  if (typeof value !== 'number') { throw new Error(value + " isn't an integer, can't use it with $pop"); }
   if (value === 0) { return; }
 
   if (value > 0) {
@@ -2389,7 +2451,7 @@ lastStepModifierFunctions.$pop = function (obj, field, value) {
 lastStepModifierFunctions.$pull = function (obj, field, value) {
   var arr, i;
 
-  if (!util.isArray(obj[field])) { throw "Can't $pull an element from non-array values"; }
+  if (!util.isArray(obj[field])) { throw new Error("Can't $pull an element from non-array values"); }
 
   arr = obj[field];
   for (i = arr.length - 1; i >= 0; i -= 1) {
@@ -2404,13 +2466,13 @@ lastStepModifierFunctions.$pull = function (obj, field, value) {
  * Increment a numeric field's value
  */
 lastStepModifierFunctions.$inc = function (obj, field, value) {
-  if (typeof value !== 'number') { throw value + " must be a number"; }
+  if (typeof value !== 'number') { throw new Error(value + " must be a number"); }
 
   if (typeof obj[field] !== 'number') {
     if (!_.has(obj, field)) {
       obj[field] = value;
     } else {
-      throw "Don't use the $inc modifier on non-number fields";
+      throw new Error("Don't use the $inc modifier on non-number fields");
     }
   } else {
     obj[field] += value;
@@ -2447,10 +2509,10 @@ function modify (obj, updateQuery) {
     , newDoc, modifiers
     ;
 
-  if (keys.indexOf('_id') !== -1 && updateQuery._id !== obj._id) { throw "You cannot change a document's _id"; }
+  if (keys.indexOf('_id') !== -1 && updateQuery._id !== obj._id) { throw new Error("You cannot change a document's _id"); }
 
   if (dollarFirstChars.length !== 0 && dollarFirstChars.length !== firstChars.length) {
-    throw "You cannot mix modifiers and normal fields";
+    throw new Error("You cannot mix modifiers and normal fields");
   }
 
   if (dollarFirstChars.length === 0) {
@@ -2464,12 +2526,12 @@ function modify (obj, updateQuery) {
     modifiers.forEach(function (m) {
       var keys;
 
-      if (!modifierFunctions[m]) { throw "Unknown modifier " + m; }
+      if (!modifierFunctions[m]) { throw new Error("Unknown modifier " + m); }
 
       // Can't rely on Object.keys throwing on non objects since ES6{
       // Not 100% satisfying as non objects can be interpreted as objects but no false negatives so we can live with it
       if (typeof updateQuery[m] !== 'object') {
-        throw "Modifier " + m + "'s argument must be an object";
+        throw new Error("Modifier " + m + "'s argument must be an object");
       }
 
       keys = Object.keys(updateQuery[m]);
@@ -2482,7 +2544,7 @@ function modify (obj, updateQuery) {
   // Check result is valid and return it
   checkObject(newDoc);
 
-  if (obj._id !== newDoc._id) { throw "You can't change a document's _id"; }
+  if (obj._id !== newDoc._id) { throw new Error("You can't change a document's _id"); }
   return newDoc;
 };
 
@@ -2543,7 +2605,7 @@ function areThingsEqual (a, b) {
 
   // Arrays (no match since arrays are used as a $in)
   // undefined (no match since they mean field doesn't exist and can't be serialized)
-  if (util.isArray(a) || util.isArray(b) || a === undefined || b === undefined) { return false; }
+  if ((!(util.isArray(a) && util.isArray(b)) && (util.isArray(a) || util.isArray(b))) || a === undefined || b === undefined) { return false; }
 
   // General objects (check for deep equality)
   // a and b should be objects at this point
@@ -2607,7 +2669,7 @@ comparisonFunctions.$ne = function (a, b) {
 comparisonFunctions.$in = function (a, b) {
   var i;
 
-  if (!util.isArray(b)) { throw "$in operator called with a non-array"; }
+  if (!util.isArray(b)) { throw new Error("$in operator called with a non-array"); }
 
   for (i = 0; i < b.length; i += 1) {
     if (areThingsEqual(a, b[i])) { return true; }
@@ -2617,13 +2679,13 @@ comparisonFunctions.$in = function (a, b) {
 };
 
 comparisonFunctions.$nin = function (a, b) {
-  if (!util.isArray(b)) { throw "$nin operator called with a non-array"; }
+  if (!util.isArray(b)) { throw new Error("$nin operator called with a non-array"); }
 
   return !comparisonFunctions.$in(a, b);
 };
 
 comparisonFunctions.$regex = function (a, b) {
-  if (!util.isRegExp(b)) { throw "$regex operator called with non regular expression"; }
+  if (!util.isRegExp(b)) { throw new Error("$regex operator called with non regular expression"); }
 
   if (typeof a !== 'string') {
     return false
@@ -2649,7 +2711,7 @@ comparisonFunctions.$exists = function (value, exists) {
 // Specific to arrays
 comparisonFunctions.$size = function (obj, value) {
     if (!util.isArray(obj)) { return false; }
-    if (value % 1 !== 0) { throw "$size operator called without an integer"; }
+    if (value % 1 !== 0) { throw new Error("$size operator called without an integer"); }
 
     return (obj.length == value);
 };
@@ -2664,7 +2726,7 @@ arrayComparisonFunctions.$size = true;
 logicalOperators.$or = function (obj, query) {
   var i;
 
-  if (!util.isArray(query)) { throw "$or operator used without an array"; }
+  if (!util.isArray(query)) { throw new Error("$or operator used without an array"); }
 
   for (i = 0; i < query.length; i += 1) {
     if (match(obj, query[i])) { return true; }
@@ -2682,7 +2744,7 @@ logicalOperators.$or = function (obj, query) {
 logicalOperators.$and = function (obj, query) {
   var i;
 
-  if (!util.isArray(query)) { throw "$and operator used without an array"; }
+  if (!util.isArray(query)) { throw new Error("$and operator used without an array"); }
 
   for (i = 0; i < query.length; i += 1) {
     if (!match(obj, query[i])) { return false; }
@@ -2710,10 +2772,10 @@ logicalOperators.$not = function (obj, query) {
 logicalOperators.$where = function (obj, fn) {
   var result;
 
-  if (!_.isFunction(fn)) { throw "$where operator used without a function"; }
+  if (!_.isFunction(fn)) { throw new Error("$where operator used without a function"); }
 
   result = fn.call(obj);
-  if (!_.isBoolean(result)) { throw "$where function must return boolean"; }
+  if (!_.isBoolean(result)) { throw new Error("$where function must return boolean"); }
 
   return result;
 };
@@ -2741,7 +2803,7 @@ function match (obj, query) {
     queryValue = query[queryKey];
 
     if (queryKey[0] === '$') {
-      if (!logicalOperators[queryKey]) { throw "Unknown logical operator " + queryKey; }
+      if (!logicalOperators[queryKey]) { throw new Error("Unknown logical operator " + queryKey); }
       if (!logicalOperators[queryKey](obj, queryValue)) { return false; }
     } else {
       if (!matchQueryPart(obj, queryKey, queryValue)) { return false; }
@@ -2762,6 +2824,11 @@ function matchQueryPart (obj, queryKey, queryValue, treatObjAsValue) {
 
   // Check if the value is an array if we don't force a treatment as value
   if (util.isArray(objValue) && !treatObjAsValue) {
+    // If the queryValue is an array, try to perform an exact match
+    if (util.isArray(queryValue)) {
+      return matchQueryPart(obj, queryKey, queryValue, true);
+    }
+
     // Check if we are using an array-specific comparison function
     if (queryValue !== null && typeof queryValue === 'object' && !util.isRegExp(queryValue)) {
       keys = Object.keys(queryValue);
@@ -2779,19 +2846,19 @@ function matchQueryPart (obj, queryKey, queryValue, treatObjAsValue) {
 
   // queryValue is an actual object. Determine whether it contains comparison operators
   // or only normal fields. Mixed objects are not allowed
-  if (queryValue !== null && typeof queryValue === 'object' && !util.isRegExp(queryValue)) {
+  if (queryValue !== null && typeof queryValue === 'object' && !util.isRegExp(queryValue) && !util.isArray(queryValue)) {
     keys = Object.keys(queryValue);
     firstChars = _.map(keys, function (item) { return item[0]; });
     dollarFirstChars = _.filter(firstChars, function (c) { return c === '$'; });
 
     if (dollarFirstChars.length !== 0 && dollarFirstChars.length !== firstChars.length) {
-      throw "You cannot mix operators and normal fields";
+      throw new Error("You cannot mix operators and normal fields");
     }
 
     // queryValue is an object of this form: { $comparisonOperator1: value1, ... }
     if (dollarFirstChars.length > 0) {
       for (i = 0; i < keys.length; i += 1) {
-        if (!comparisonFunctions[keys[i]]) { throw "Unknown comparison function " + keys[i]; }
+        if (!comparisonFunctions[keys[i]]) { throw new Error("Unknown comparison function " + keys[i]); }
 
         if (!comparisonFunctions[keys[i]](objValue, queryValue[keys[i]])) { return false; }
       }
@@ -2854,15 +2921,15 @@ function Persistence (options) {
   this.corruptAlertThreshold = options.corruptAlertThreshold !== undefined ? options.corruptAlertThreshold : 0.1;
 
   if (!this.inMemoryOnly && this.filename && this.filename.charAt(this.filename.length - 1) === '~') {
-    throw "The datafile name can't end with a ~, which is reserved for crash safe backup files";
+    throw new Error("The datafile name can't end with a ~, which is reserved for crash safe backup files");
   }
 
   // After serialization and before deserialization hooks with some basic sanity checks
   if (options.afterSerialization && !options.beforeDeserialization) {
-    throw "Serialization hook defined but deserialization hook undefined, cautiously refusing to start NeDB to prevent dataloss";
+    throw new Error("Serialization hook defined but deserialization hook undefined, cautiously refusing to start NeDB to prevent dataloss");
   }
   if (!options.afterSerialization && options.beforeDeserialization) {
-    throw "Serialization hook undefined but deserialization hook defined, cautiously refusing to start NeDB to prevent dataloss";
+    throw new Error("Serialization hook undefined but deserialization hook defined, cautiously refusing to start NeDB to prevent dataloss");
   }
   this.afterSerialization = options.afterSerialization || function (s) { return s; };
   this.beforeDeserialization = options.beforeDeserialization || function (s) { return s; };
@@ -2870,7 +2937,7 @@ function Persistence (options) {
     for (j = 0; j < 10; j += 1) {
       randomString = customUtils.uid(i);
       if (this.beforeDeserialization(this.afterSerialization(randomString)) !== randomString) {
-        throw "beforeDeserialization is not the reverse of afterSerialization, cautiously refusing to start NeDB to prevent dataloss";
+        throw new Error("beforeDeserialization is not the reverse of afterSerialization, cautiously refusing to start NeDB to prevent dataloss");
       }
     }
   }
@@ -2914,21 +2981,21 @@ Persistence.getNWAppFilename = function (appName, relativeFilename) {
     case 'win32':
     case 'win64':
       home = process.env.LOCALAPPDATA || process.env.APPDATA;
-      if (!home) { throw "Couldn't find the base application data folder"; }
+      if (!home) { throw new Error("Couldn't find the base application data folder"); }
       home = path.join(home, appName);
       break;
     case 'darwin':
       home = process.env.HOME;
-      if (!home) { throw "Couldn't find the base application data directory"; }
+      if (!home) { throw new Error("Couldn't find the base application data directory"); }
       home = path.join(home, 'Library', 'Application Support', appName);
       break;
     case 'linux':
       home = process.env.HOME;
-      if (!home) { throw "Couldn't find the base application data directory"; }
+      if (!home) { throw new Error("Couldn't find the base application data directory"); }
       home = path.join(home, '.config', appName);
       break;
     default:
-      throw "Can't use the Node Webkit relative path for platform " + process.platform;
+      throw new Error("Can't use the Node Webkit relative path for platform " + process.platform);
       break;
   }
 
@@ -2959,7 +3026,11 @@ Persistence.prototype.persistCachedDatabase = function (cb) {
     }
   });
 
-  storage.crashSafeWriteFile(this.filename, toPersist, callback);
+  storage.crashSafeWriteFile(this.filename, toPersist, function (err) {
+    if (err) { return callback(err); }
+    self.db.emit('compaction.done');
+    return callback(null);
+  });
 };
 
 
@@ -3060,7 +3131,7 @@ Persistence.prototype.treatRawData = function (rawData) {
 
   // A bit lenient on corruption
   if (data.length > 0 && corruptItems / data.length > this.corruptAlertThreshold) {
-    throw "More than " + Math.floor(100 * this.corruptAlertThreshold) + "% of the data file is corrupt, the wrong beforeDeserialization hook may be used. Cautiously refusing to start NeDB to prevent dataloss"
+    throw new Error("More than " + Math.floor(100 * this.corruptAlertThreshold) + "% of the data file is corrupt, the wrong beforeDeserialization hook may be used. Cautiously refusing to start NeDB to prevent dataloss");
   }
 
   Object.keys(dataById).forEach(function (k) {
@@ -4264,14 +4335,14 @@ _AVLTree.prototype.checkHeightCorrect = function () {
 
   if (!this.hasOwnProperty('key')) { return; }   // Empty tree
 
-  if (this.left && this.left.height === undefined) { throw "Undefined height for node " + this.left.key; }
-  if (this.right && this.right.height === undefined) { throw "Undefined height for node " + this.right.key; }
-  if (this.height === undefined) { throw "Undefined height for node " + this.key; }
+  if (this.left && this.left.height === undefined) { throw new Error("Undefined height for node " + this.left.key); }
+  if (this.right && this.right.height === undefined) { throw new Error("Undefined height for node " + this.right.key); }
+  if (this.height === undefined) { throw new Error("Undefined height for node " + this.key); }
 
   leftH = this.left ? this.left.height : 0;
   rightH = this.right ? this.right.height : 0;
 
-  if (this.height !== 1 + Math.max(leftH, rightH)) { throw "Height constraint failed for node " + this.key; }
+  if (this.height !== 1 + Math.max(leftH, rightH)) { throw new Error("Height constraint failed for node " + this.key); }
   if (this.left) { this.left.checkHeightCorrect(); }
   if (this.right) { this.right.checkHeightCorrect(); }
 };
@@ -4292,7 +4363,7 @@ _AVLTree.prototype.balanceFactor = function () {
  * Check that the balance factors are all between -1 and 1
  */
 _AVLTree.prototype.checkBalanceFactors = function () {
-  if (Math.abs(this.balanceFactor()) > 1) { throw 'Tree is unbalanced at node ' + this.key; }
+  if (Math.abs(this.balanceFactor()) > 1) { throw new Error('Tree is unbalanced at node ' + this.key); }
 
   if (this.left) { this.left.checkBalanceFactors(); }
   if (this.right) { this.right.checkBalanceFactors(); }
@@ -4471,10 +4542,10 @@ _AVLTree.prototype.insert = function (key, value) {
     // Same key: no change in the tree structure
     if (currentNode.compareKeys(currentNode.key, key) === 0) {
       if (currentNode.unique) {
-        throw { message: "Can't insert key " + key + ", it violates the unique constraint"
-              , key: key
-              , errorType: 'uniqueViolated'
-              };
+        var err = new Error("Can't insert key " + key + ", it violates the unique constraint");
+        err.key = key;
+        err.errorType = 'uniqueViolated';
+        throw err;
       } else {
         currentNode.data.push(value);
       }
@@ -4755,7 +4826,7 @@ BinarySearchTree.prototype.checkNodeOrdering = function () {
   if (this.left) {
     this.left.checkAllNodesFullfillCondition(function (k) {
       if (self.compareKeys(k, self.key) >= 0) {
-        throw 'Tree with root ' + self.key + ' is not a binary search tree';
+        throw new Error('Tree with root ' + self.key + ' is not a binary search tree');
       }
     });
     this.left.checkNodeOrdering();
@@ -4764,7 +4835,7 @@ BinarySearchTree.prototype.checkNodeOrdering = function () {
   if (this.right) {
     this.right.checkAllNodesFullfillCondition(function (k) {
       if (self.compareKeys(k, self.key) <= 0) {
-        throw 'Tree with root ' + self.key + ' is not a binary search tree';
+        throw new Error('Tree with root ' + self.key + ' is not a binary search tree');
       }
     });
     this.right.checkNodeOrdering();
@@ -4777,12 +4848,12 @@ BinarySearchTree.prototype.checkNodeOrdering = function () {
  */
 BinarySearchTree.prototype.checkInternalPointers = function () {
   if (this.left) {
-    if (this.left.parent !== this) { throw 'Parent pointer broken for key ' + this.key; }
+    if (this.left.parent !== this) { throw new Error('Parent pointer broken for key ' + this.key); }
     this.left.checkInternalPointers();
   }
 
   if (this.right) {
-    if (this.right.parent !== this) { throw 'Parent pointer broken for key ' + this.key; }
+    if (this.right.parent !== this) { throw new Error('Parent pointer broken for key ' + this.key); }
     this.right.checkInternalPointers();
   }
 };
@@ -4794,7 +4865,7 @@ BinarySearchTree.prototype.checkInternalPointers = function () {
 BinarySearchTree.prototype.checkIsBST = function () {
   this.checkNodeOrdering();
   this.checkInternalPointers();
-  if (this.parent) { throw "The root shouldn't have a parent"; }
+  if (this.parent) { throw new Error("The root shouldn't have a parent"); }
 };
 
 
@@ -4872,10 +4943,10 @@ BinarySearchTree.prototype.insert = function (key, value) {
   // Same key as root
   if (this.compareKeys(this.key, key) === 0) {
     if (this.unique) {
-      throw { message: "Can't insert key " + key + ", it violates the unique constraint"
-            , key: key
-            , errorType: 'uniqueViolated'
-            };
+      var err = new Error("Can't insert key " + key + ", it violates the unique constraint");
+      err.key = key;
+      err.errorType = 'uniqueViolated';
+      throw err;
     } else {
       this.data.push(value);
     }
@@ -5227,7 +5298,10 @@ function defaultCompareKeysFunction (a, b) {
   if (a > b) { return 1; }
   if (a === b) { return 0; }
 
-  throw { message: "Couldn't compare elements", a: a, b: b };
+  var err = new Error("Couldn't compare elements");
+  err.a = a;
+  err.b = b;
+  throw err;
 }
 module.exports.defaultCompareKeysFunction = defaultCompareKeysFunction;
 
